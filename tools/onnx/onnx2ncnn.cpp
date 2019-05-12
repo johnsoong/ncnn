@@ -167,19 +167,64 @@ static int get_tensor_proto_data_size(const onnx::TensorProto& tp)
     return 0;
 }
 
-static void fwrite_tensor_proto_data(const onnx::TensorProto& tp, FILE* bp)
+static int quantize_weight(float *data, size_t data_length, std::vector<unsigned short>& float16_weights)
 {
+    float16_weights.resize(data_length);
+
+    for (size_t i = 0; i < data_length; i++)
+    {
+        float f = data[i];
+
+        unsigned short fp16 = float2half(f);
+
+        float16_weights[i] = fp16;
+    }
+
+    // magic tag for half-precision floating point
+    return 0x01306B47;
+}
+
+static void fwrite_tensor_proto_data(const onnx::TensorProto& tp, FILE* bp, int quantize_level = 0)
+{
+    std::vector<unsigned short> float16_weights;
+    int quantize_tag = 0;
     int size = get_tensor_proto_data_size(tp);
+    int p0 = ftell(bp);
 
     if (tp.has_raw_data())
     {
         const std::string& raw_data = tp.raw_data();
-        fwrite(raw_data.data(), sizeof(float), size, bp);
+        // fwrite(raw_data.data(), sizeof(float), size, bp);
+        quantize_tag = quantize_weight((float *)raw_data.data(), size, float16_weights);
+        if(quantize_tag == 0 || quantize_level == 0)
+            fwrite(raw_data.data(), sizeof(float), size, bp);
+        else
+            fwrite(float16_weights.data(), sizeof(unsigned short), float16_weights.size(), bp);
     }
     else if (tp.data_type() == 1)
     {
-        fwrite(tp.float_data().data(), sizeof(float), size, bp);
+        // fwrite(tp.float_data().data(), sizeof(float), size, bp);
+        quantize_tag = quantize_weight((float *)tp.float_data().data(), size, float16_weights);
+        if(quantize_tag == 0 || quantize_level == 0)
+            fwrite(tp.float_data().data(), sizeof(float), size, bp);
+        else
+            fwrite(float16_weights.data(), sizeof(unsigned short), float16_weights.size(), bp);
     }
+    if(quantize_level != 0){
+        int nwrite = ftell(bp) - p0;
+        int nalign = alignSize(nwrite, 4);
+        unsigned char padding[4] = {0x00, 0x00, 0x00, 0x00};
+        fwrite(padding, sizeof(unsigned char), nalign - nwrite, bp);
+    }
+    // if (tp.has_raw_data())
+    // {
+    //     const std::string& raw_data = tp.raw_data();
+    //     fwrite(raw_data.data(), sizeof(float), size, bp);
+    // }
+    // else if (tp.data_type() == 1)
+    // {
+    //     fwrite(tp.float_data().data(), sizeof(float), size, bp);
+    // }
 }
 
 int main(int argc, char** argv)
@@ -187,7 +232,13 @@ int main(int argc, char** argv)
     const char* onnxpb = argv[1];
     const char* ncnn_prototxt = argc >= 4 ? argv[2] : "ncnn.param";
     const char* ncnn_modelbin = argc >= 4 ? argv[3] : "ncnn.bin";
+    const char* quantize_param = argc == 5 ? argv[4] : "0";
+    int quantize_level = atoi(quantize_param);
 
+    if (quantize_level != 0 && quantize_level != 65536) {
+        fprintf(stderr, "%s: only support quantize level = 0 or 65536", argv[0]);
+        return -1;
+    }
     onnx::ModelProto model;
 
     // load
@@ -1058,14 +1109,16 @@ int main(int argc, char** argv)
             }
 
             int quantize_tag = 0;
+            if(quantize_level != 0)
+                quantize_tag = 0x01306B47;
             fwrite(&quantize_tag, sizeof(int), 1, bp);
 
-            fwrite_tensor_proto_data(W, bp);
+            fwrite_tensor_proto_data(W, bp, quantize_level);
 
             if (has_bias)
             {
                 const onnx::TensorProto& B = weights[node.input(2)];
-                fwrite_tensor_proto_data(B, bp);
+                fwrite_tensor_proto_data(B, bp, quantize_level);
             }
         }
         else if (op == "ConvTranspose")
